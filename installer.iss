@@ -4,9 +4,9 @@
 ; ============================================================
 
 #define AppName      "Photo Organizer"
-#define AppVersion   "1.0.0"
+#define AppVersion   "1.1.0"
 #define AppPublisher "Your Name"
-#define AppURL       "https://github.com/YOUR_USERNAME/photo-organizer"
+#define AppURL       "https://github.com/Nonflavored/photo-organizer"
 #define AppExeName   "Photo Organizer.exe"
 
 [Setup]
@@ -22,7 +22,7 @@ AllowNoIcons=yes
 LicenseFile=
 OutputDir=installer_output
 OutputBaseFilename=PhotoOrganizer_Setup_v{#AppVersion}
-SetupIconFile=
+SetupIconFile=icon.ico
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern

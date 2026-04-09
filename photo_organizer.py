@@ -7,20 +7,24 @@ Photo & Video Organizer  v1.1.0
 - Safe cancel (keeps progress)
 - Remembers last 2 source/dest folders
 - Live progress dashboard
-- Duplicate detection: size filter → MD5 hash → moves to _duplicates
+- Duplicate detection: size filter → MD5 hash
+- Snapchat memories_history.json date import
 """
 
-import os, re, shutil, threading, json, time, hashlib, urllib.request
+import os, re, shutil, threading, json, time, hashlib, urllib.request, base64, tempfile, sys
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from collections import defaultdict
 
 # ── Version ───────────────────────────────────────────────────────────────────
 APP_VERSION   = "1.1.0"
-UPDATE_URL    = "https://raw.githubusercontent.com/YOUR_USERNAME/photo-organizer/main/version.json"
-DOWNLOAD_PAGE = "https://github.com/YOUR_USERNAME/photo-organizer/releases/latest"
+UPDATE_URL    = "https://raw.githubusercontent.com/Nonflavored/photo-organizer/main/version.json"
+DOWNLOAD_PAGE = "https://github.com/Nonflavored/photo-organizer/releases/latest"
+
+# ── Embedded icon (base64 PNG 64x64) ─────────────────────────────────────────
+ICON_B64 = ""  # Populated at build time — see build.bat
 
 # ── EXIF ─────────────────────────────────────────────────────────────────────
 try:
@@ -60,6 +64,7 @@ GOLD,GOLD2     = "#f5c842","#d4a800"
 FG,FG_DIM      = "#e8e4dc","#8a8880"
 GREEN,RED,BLUE = "#8ecf72","#e05c5c","#6ab0e0"
 ORANGE,PURPLE  = "#e0923a","#b08ecf"
+SNAP_YELLOW    = "#FFFC00"
 FONT           = ("Courier New",10)
 FONT_SM        = ("Courier New",9)
 FONT_HDR       = ("Courier New",18,"bold")
@@ -98,6 +103,59 @@ def check_for_update(callback):
         if parse_version(latest) > parse_version(APP_VERSION):
             callback(latest, notes)
     except Exception: pass
+
+# ── Snapchat JSON parser ──────────────────────────────────────────────────────
+def load_snapchat_json(json_path: Path) -> dict:
+    """
+    Parses memories_history.json and returns a dict:
+    uuid_lower -> datetime
+
+    Snapchat filename format: 2022-09-30_<UUID>-main.mp4
+    JSON entry format: { "Date": "2022-09-30 14:22:17 UTC", "Download Link": "...fsid=<UUID>..." }
+    """
+    lookup = {}
+    try:
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+        entries = data.get("Saved Media", [])
+        for entry in entries:
+            date_str     = entry.get("Date","")
+            download_url = entry.get("Download Link","") or entry.get("Media Download Url","")
+
+            # Parse date
+            dt = None
+            for fmt in ["%Y-%m-%d %H:%M:%S %Z", "%Y-%m-%d %H:%M:%S"]:
+                try:
+                    dt = datetime.strptime(date_str.replace(" UTC",""), fmt.replace(" %Z",""))
+                    break
+                except: pass
+            if not dt:
+                continue
+
+            # Extract UUID from fsid= parameter
+            m = re.search(r"fsid=([A-F0-9\-]{30,})", download_url, re.IGNORECASE)
+            if m:
+                uuid = m.group(1).lower()
+                lookup[uuid] = dt
+
+    except Exception as e:
+        pass
+    return lookup
+
+def snapchat_date(path: Path, snap_lookup: dict):
+    """Try to match this file's UUID to the Snapchat lookup table."""
+    if not snap_lookup:
+        return None
+    # Filename pattern: 2022-09-30_<UUID>-main.ext or 2022-09-30_<UUID>.ext
+    name = path.stem
+    # Remove trailing -main if present
+    name = re.sub(r'-main$', '', name, flags=re.IGNORECASE)
+    # UUID is after the first underscore
+    parts = name.split("_", 1)
+    if len(parts) == 2:
+        uuid = parts[1].lower()
+        if uuid in snap_lookup:
+            return snap_lookup[uuid]
+    return None
 
 # ── Date extraction ───────────────────────────────────────────────────────────
 DATE_PATTERNS = [
@@ -140,52 +198,45 @@ def filename_date(path: Path):
             except ValueError: pass
     return None
 
-def best_date_and_model(path: Path):
+def best_date_and_model(path: Path, snap_lookup: dict):
+    # Snapchat JSON first (most precise for snap files)
+    dt = snapchat_date(path, snap_lookup)
+    if dt: return dt, None, "Snapchat"
+
     dt, model = exif_info(path)
     if dt: return dt, model, "EXIF"
+
     dt = filename_date(path)
     if dt: return dt, None, "Filename"
+
     return datetime.fromtimestamp(path.stat().st_mtime), None, "Modified"
 
 # ── Duplicate detection ───────────────────────────────────────────────────────
-HASH_CHUNK = 1024 * 1024   # 1MB chunks for hashing
+HASH_CHUNK = 1024 * 1024
 
-def file_md5(path: Path, progress_cb=None) -> str:
+def file_md5(path: Path) -> str:
     h = hashlib.md5()
-    size = path.stat().st_size
-    done = 0
     with open(path, "rb") as f:
         while chunk := f.read(HASH_CHUNK):
             h.update(chunk)
-            done += len(chunk)
-            if progress_cb:
-                progress_cb(done, size)
     return h.hexdigest()
 
 def find_duplicates(files: list, log_cb, progress_cb, cancel_flag):
-    """
-    Two-pass duplicate detection:
-    Pass 1 — group by file size (fast, eliminates most files immediately)
-    Pass 2 — MD5 hash within each size group (accurate)
-
-    Returns dict: md5_hash -> list of Path (first = original, rest = duplicates)
-    """
     log_cb("info", f"Duplicate scan — pass 1: grouping {len(files):,} files by size...")
     size_groups = defaultdict(list)
     for p in files:
         try: size_groups[p.stat().st_size].append(p)
-        except Exception: pass
+        except: pass
 
-    # Only keep groups with 2+ files (potential duplicates)
     candidates = {s: ps for s, ps in size_groups.items() if len(ps) > 1}
     candidate_count = sum(len(v) for v in candidates.values())
-    log_cb("info", f"Pass 1 complete — {candidate_count:,} files in {len(candidates):,} size groups need hashing")
+    log_cb("info", f"Pass 1 done — {candidate_count:,} files in {len(candidates):,} size groups need hashing")
 
     if not candidates:
-        log_cb("info", "No size matches found — no duplicates detected.")
+        log_cb("info", "No size matches — no duplicates.")
         return {}
 
-    log_cb("info", "Pass 2: computing MD5 hashes on size matches...")
+    log_cb("info", "Pass 2: MD5 hashing size matches...")
     hash_groups = defaultdict(list)
     processed = 0
 
@@ -198,15 +249,13 @@ def find_duplicates(files: list, log_cb, progress_cb, cancel_flag):
                 h = file_md5(p)
                 hash_groups[h].append(p)
                 processed += 1
-                progress_cb(processed, candidate_count,
-                             f"Hashing: {p.name}")
+                progress_cb(processed, candidate_count, f"Hashing: {p.name}")
             except Exception as e:
                 log_cb("err", f"✗ Hash failed {p.name}: {e}")
 
-    # Keep only confirmed duplicates (2+ files with same hash)
     dupes = {h: ps for h, ps in hash_groups.items() if len(ps) > 1}
-    dupe_count = sum(len(v)-1 for v in dupes.values())  # -1 = keep one original
-    log_cb("info", f"Pass 2 complete — {dupe_count:,} duplicates found across {len(dupes):,} groups")
+    dupe_count = sum(len(v)-1 for v in dupes.values())
+    log_cb("info", f"Pass 2 done — {dupe_count:,} duplicates across {len(dupes):,} groups")
     return dupes
 
 # ── Rename tokens ─────────────────────────────────────────────────────────────
@@ -243,7 +292,7 @@ def fmt_time(s):
     if s < 3600: return f"{int(s//60)}m {int(s%60)}s"
     return f"{int(s//3600)}h {int((s%3600)//60)}m"
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── File collection ───────────────────────────────────────────────────────────
 def collect_files(source, recursive, log_cb):
     media, xmps = [], {}
     ext_counts = defaultdict(int)
@@ -274,14 +323,14 @@ def safe_move(src, dst):
 
 # ── Core worker ───────────────────────────────────────────────────────────────
 def run_job(source, dest, recursive, dry_run, fmt_tokens, fmt_sep,
-            check_dupes, cancel_flag, callbacks):
+            check_dupes, snap_json_path, cancel_flag, callbacks):
 
-    log     = callbacks["log"]
-    stat_cb = callbacks["stat"]
-    prog_cb = callbacks["progress"]
-    curr_cb = callbacks["current"]
-    done_cb = callbacks["done"]
-    phase_cb= callbacks["phase"]
+    log      = callbacks["log"]
+    stat_cb  = callbacks["stat"]
+    prog_cb  = callbacks["progress"]
+    curr_cb  = callbacks["current"]
+    done_cb  = callbacks["done"]
+    phase_cb = callbacks["phase"]
 
     source = Path(os.path.normpath(str(source)))
     dest   = Path(os.path.normpath(str(dest)))
@@ -292,7 +341,19 @@ def run_job(source, dest, recursive, dry_run, fmt_tokens, fmt_sep,
         done_cb(0,0,0,0,0,"error")
         return
 
-    # ── Phase 1: collect ──────────────────────────────────────────────────────
+    # ── Load Snapchat JSON if provided ────────────────────────────────────────
+    snap_lookup = {}
+    if snap_json_path:
+        snap_path = Path(os.path.normpath(str(snap_json_path)))
+        if snap_path.exists():
+            phase_cb("LOADING SNAPCHAT DATA")
+            log("info", f"Loading Snapchat data from: {snap_path.name}...")
+            snap_lookup = load_snapchat_json(snap_path)
+            log("info", f"Snapchat lookup ready — {len(snap_lookup):,} entries loaded")
+        else:
+            log("warn", f"Snapchat JSON not found: {snap_path}")
+
+    # ── Collect files ─────────────────────────────────────────────────────────
     phase_cb("SCANNING")
     media, xmps = collect_files(source, recursive, log)
     total = len(media)
@@ -303,8 +364,8 @@ def run_job(source, dest, recursive, dry_run, fmt_tokens, fmt_sep,
 
     log("info", f"Found {total:,} media files  +  {len(xmps):,} XMP sidecars")
 
-    # ── Phase 2: duplicate detection (optional) ───────────────────────────────
-    dupe_set = set()   # paths that are duplicates (not the "keep" copy)
+    # ── Duplicate detection ───────────────────────────────────────────────────
+    dupe_set = set()
     dupes_moved = 0
 
     if check_dupes:
@@ -312,12 +373,9 @@ def run_job(source, dest, recursive, dry_run, fmt_tokens, fmt_sep,
         log("divider","")
         log("info", "Starting duplicate detection...")
 
-        def dupe_prog(done, total_d, name=""):
-            prog_cb(done, total_d)
-            curr_cb(name)
-
-        dupe_groups = find_duplicates(media, log, dupe_prog, cancel_flag)
-
+        dupe_groups = find_duplicates(media, log,
+                                       lambda v,t,c="": (prog_cb(v,t,c), curr_cb(c)),
+                                       cancel_flag)
         if cancel_flag():
             done_cb(0,0,0,0,0,"cancelled")
             return
@@ -326,41 +384,32 @@ def run_job(source, dest, recursive, dry_run, fmt_tokens, fmt_sep,
             dupes_folder = dest / "_duplicates"
             if not dry_run:
                 dupes_folder.mkdir(parents=True, exist_ok=True)
-
             log("divider","")
-            log("info", f"Moving duplicates to  _duplicates/  ...")
-
+            log("info", f"Moving duplicates to _duplicates/...")
             for h, paths in dupe_groups.items():
-                # Sort by modified date — keep the oldest as the "original"
                 paths_sorted = sorted(paths, key=lambda p: p.stat().st_mtime)
                 original = paths_sorted[0]
-                dupes    = paths_sorted[1:]
-
-                log("info", f"  KEEP    {original.name}")
-                for dp in dupes:
+                log("info", f"  KEEP  {original.name}")
+                for dp in paths_sorted[1:]:
                     dst_path = dupes_folder / dp.name
-                    if not dry_run:
-                        safe_move(dp, dst_path)
+                    if not dry_run: safe_move(dp, dst_path)
                     action = "DRY→" if dry_run else "→"
-                    log("warn", f"  DUPE    {dp.name}  {action}  _duplicates/{dp.name}")
+                    log("warn", f"  DUPE  {dp.name}  {action}  _duplicates/")
                     dupe_set.add(str(dp))
                     dupes_moved += 1
-
-            log("info", f"Duplicates handled: {dupes_moved:,} moved to _duplicates/")
+            log("info", f"{dupes_moved:,} duplicates moved to _duplicates/")
         else:
             log("info", "No duplicates found.")
-
         log("divider","")
 
-    # ── Phase 3: organize ─────────────────────────────────────────────────────
+    # ── Organize ──────────────────────────────────────────────────────────────
     phase_cb("ORGANIZING")
     log("info", "Sorting files by date...")
 
     resolved = []
     for p in media:
-        if str(p) in dupe_set:
-            continue   # already handled
-        dt, cam, lbl = best_date_and_model(p)
+        if str(p) in dupe_set: continue
+        dt, cam, lbl = best_date_and_model(p, snap_lookup)
         resolved.append((p, dt, cam, lbl))
     resolved.sort(key=lambda x: x[1])
 
@@ -408,9 +457,10 @@ def run_job(source, dest, recursive, dry_run, fmt_tokens, fmt_sep,
                 xmps_moved += 1
                 xmp_tag = " +xmp"
 
+            src_lbl_display = "Snap" if src_lbl == "Snapchat" else src_lbl
             action = "DRY→" if dry_run else "→"
             curr_cb(f"{src_path.name}  {action}  {year_str}/{month_str}/{new_name}{xmp_tag}")
-            log("file", f"[{src_lbl:8s}]  {src_path.name}  {action}  {new_name}{xmp_tag}")
+            log("file", f"[{src_lbl_display:8s}]  {src_path.name}  {action}  {new_name}{xmp_tag}")
 
         except Exception as e:
             log("err", f"✗ {src_path.name}: {e}")
@@ -442,17 +492,16 @@ class StatBox(tk.Frame):
 class UpdateBanner(tk.Frame):
     def __init__(self, parent, version, notes):
         super().__init__(parent, bg="#1a2a1a", pady=6, padx=14)
-        msg = f"🆕  Version {version} available"
+        msg = f"New version {version} available"
         if notes: msg += f"  —  {notes}"
         tk.Label(self, text=msg, bg="#1a2a1a", fg=GREEN, font=FONT_SM).pack(side="left")
         tk.Button(self, text="Download Update", bg=GREEN, fg="#111418",
                    font=FONT_SM, relief="flat", padx=8, pady=2, cursor="hand2",
                    command=lambda: os.startfile(DOWNLOAD_PAGE)).pack(side="left", padx=10)
-        tk.Button(self, text="✕", bg="#1a2a1a", fg=FG_DIM, font=FONT_SM,
+        tk.Button(self, text="x", bg="#1a2a1a", fg=FG_DIM, font=FONT_SM,
                    relief="flat", padx=4, cursor="hand2",
                    command=self.destroy).pack(side="right")
 
-# ── Rename Builder ────────────────────────────────────────────────────────────
 class RenameBuilder(tk.Toplevel):
     def __init__(self, parent, current_tokens, current_sep, on_apply):
         super().__init__(parent)
@@ -470,19 +519,19 @@ class RenameBuilder(tk.Toplevel):
     def _build(self):
         tk.Label(self, text="RENAME FORMAT BUILDER", bg=BG, fg=GOLD,
                   font=("Courier New",13,"bold")).pack(pady=(14,2), padx=20, anchor="w")
-        tk.Label(self, text="Add tokens, reorder with ◀▶, remove with ✕. Preview updates live.",
+        tk.Label(self, text="Add tokens, reorder with arrows, remove with x. Preview updates live.",
                   bg=BG, fg=FG_DIM, font=FONT_SM).pack(padx=20, anchor="w")
 
         sep_row = tk.Frame(self, bg=BG)
         sep_row.pack(fill="x", padx=20, pady=(10,4))
         tk.Label(sep_row, text="Separator:", bg=BG, fg=FG, font=FONT).pack(side="left")
-        for label, val in [("Dash  -","-"),("Underscore  _","_"),("Dot  .",".")]:
+        for label, val in [("Dash -","-"),("Underscore _","_"),("Dot .",".")]:
             tk.Radiobutton(sep_row, text=label, variable=self.sep_var, value=val,
                            bg=BG, fg=FG, selectcolor=BG3,
                            activebackground=BG, activeforeground=GOLD,
                            font=FONT, command=self._refresh).pack(side="left", padx=8)
 
-        tk.Label(self, text="YOUR FORMAT  (active tokens):",
+        tk.Label(self, text="YOUR FORMAT:",
                   bg=BG, fg=FG_DIM, font=FONT_SM).pack(padx=20, anchor="w", pady=(8,2))
         self.token_frame = tk.Frame(self, bg=BG2, pady=8, padx=8, height=52)
         self.token_frame.pack(fill="x", padx=20)
@@ -496,7 +545,7 @@ class RenameBuilder(tk.Toplevel):
             if idx % 4 == 0:
                 row = tk.Frame(avail, bg=BG)
                 row.pack(fill="x", pady=1)
-            tk.Button(row, text=f"＋ {tok['label']}",
+            tk.Button(row, text=f"+ {tok['label']}",
                        bg=BG3, fg=FG, font=FONT_SM, relief="flat",
                        padx=8, pady=4, cursor="hand2",
                        command=lambda t=tok["id"]: self._add(t)).pack(side="left", padx=(0,4))
@@ -510,7 +559,7 @@ class RenameBuilder(tk.Toplevel):
 
         btn_row = tk.Frame(self, bg=BG)
         btn_row.pack(fill="x", padx=20, pady=14)
-        tk.Button(btn_row, text="✓  Apply", bg=GOLD, fg="#111418",
+        tk.Button(btn_row, text="Apply", bg=GOLD, fg="#111418",
                    font=FONT_MED, relief="flat", padx=12, pady=6,
                    cursor="hand2", command=self._apply).pack(side="left")
         tk.Button(btn_row, text="Reset default", bg=BG3, fg=FG,
@@ -531,20 +580,20 @@ class RenameBuilder(tk.Toplevel):
             nav = tk.Frame(cell, bg=BG3)
             nav.pack(side="left", padx=(4,0))
             if i > 0:
-                tk.Button(nav, text="◀", bg=BG3, fg=GOLD, font=FONT_SM,
+                tk.Button(nav, text="<", bg=BG3, fg=GOLD, font=FONT_SM,
                            relief="flat", cursor="hand2", padx=2,
                            command=lambda x=i: self._move(x,-1)).pack(side="left")
             if i < len(self.tokens)-1:
-                tk.Button(nav, text="▶", bg=BG3, fg=GOLD, font=FONT_SM,
+                tk.Button(nav, text=">", bg=BG3, fg=GOLD, font=FONT_SM,
                            relief="flat", cursor="hand2", padx=2,
                            command=lambda x=i: self._move(x,1)).pack(side="left")
-            tk.Button(nav, text="✕", bg=BG3, fg=RED, font=FONT_SM,
+            tk.Button(nav, text="x", bg=BG3, fg=RED, font=FONT_SM,
                        relief="flat", cursor="hand2", padx=2,
                        command=lambda x=i: self._remove(x)).pack(side="left")
 
         sep    = self.sep_var.get()
         sample = render_filename(self.tokens, sep, datetime(2022,9,15), 1,
-                                  "ILCE-7RM5", "_DSC0052", ".arw")
+                                  "ILCE-7RM5", "_DSC0052", "")
         self._preview_var.set(sample if self.tokens else "(no tokens — add some above)")
 
     def _add(self, tok_id):    self.tokens.append(tok_id); self._refresh()
@@ -563,9 +612,12 @@ class OrganizerApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"Photo & Video Organizer  v{APP_VERSION}")
-        self.geometry("940x860")
+        self.geometry("940x900")
         self.resizable(True, True)
         self.configure(bg=BG)
+
+        # Set window icon
+        self._set_icon()
 
         self.cfg = load_config()
         self._cancel_requested = False
@@ -578,6 +630,16 @@ class OrganizerApp(tk.Tk):
         threading.Thread(target=check_for_update,
                           args=(self._on_update_found,), daemon=True).start()
 
+    def _set_icon(self):
+        try:
+            icon_path = Path(sys.executable).parent / "icon.ico"
+            if not icon_path.exists():
+                icon_path = Path(__file__).parent / "icon.ico"
+            if icon_path.exists():
+                self.iconbitmap(str(icon_path))
+        except Exception:
+            pass
+
     def _on_update_found(self, version, notes):
         self.after(0, lambda: UpdateBanner(self, version, notes).pack(
             fill="x", padx=0, pady=0, before=self._hdr_frame))
@@ -586,12 +648,10 @@ class OrganizerApp(tk.Tk):
         # Header
         self._hdr_frame = tk.Frame(self, bg=BG)
         self._hdr_frame.pack(fill="x", padx=20, pady=(16,4))
-        tk.Label(self._hdr_frame, text="◈ PHOTO ORGANIZER", bg=BG, fg=GOLD,
+        tk.Label(self._hdr_frame, text="PHOTO ORGANIZER", bg=BG, fg=GOLD,
                   font=FONT_HDR).pack(side="left")
         tk.Label(self._hdr_frame, text=f"v{APP_VERSION}", bg=BG, fg=FG_DIM,
                   font=FONT_SM).pack(side="left", padx=8)
-
-        # Phase indicator
         self._phase_var = tk.StringVar(value="READY")
         tk.Label(self._hdr_frame, textvariable=self._phase_var,
                   bg=BG, fg=FG_DIM, font=FONT_SM).pack(side="right")
@@ -603,6 +663,28 @@ class OrganizerApp(tk.Tk):
         self._folder_row("DESTINATION FOLDER  (leave blank = organize in-place)",
                           "dst_var", "dst_recent", self._pick_dst)
 
+        # Snapchat JSON row
+        snap_frame = tk.Frame(self, bg=BG)
+        snap_frame.pack(fill="x", padx=20, pady=3)
+        snap_hdr = tk.Frame(snap_frame, bg=BG)
+        snap_hdr.pack(fill="x")
+        self.snap_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(snap_hdr, text="Snapchat export  (memories_history.json)",
+                        variable=self.snap_var, bg=BG, fg=SNAP_YELLOW,
+                        selectcolor=BG3, activebackground=BG,
+                        activeforeground=SNAP_YELLOW,
+                        font=("Courier New",10,"bold"),
+                        command=self._toggle_snap).pack(side="left")
+        self.snap_row = tk.Frame(snap_frame, bg=BG)
+        self.snap_json_var = tk.StringVar()
+        self.snap_entry = tk.Entry(self.snap_row, textvariable=self.snap_json_var,
+                                    bg=BG3, fg=FG, insertbackground=GOLD,
+                                    font=FONT, relief="flat", bd=6)
+        self.snap_entry.pack(side="left", fill="x", expand=True)
+        tk.Button(self.snap_row, text="Browse", bg=BG3, fg=FG, font=FONT,
+                   relief="flat", padx=10, cursor="hand2",
+                   command=self._pick_snap).pack(side="left", padx=(4,0))
+
         # Rename format
         fmt_row = tk.Frame(self, bg=BG)
         fmt_row.pack(fill="x", padx=20, pady=(2,4))
@@ -610,49 +692,43 @@ class OrganizerApp(tk.Tk):
         self._fmt_preview_var = tk.StringVar()
         tk.Label(fmt_row, textvariable=self._fmt_preview_var,
                   bg=BG, fg=GOLD, font=FONT_SM).pack(side="left", padx=8)
-        tk.Button(fmt_row, text="✎ Customize", bg=BG3, fg=FG,
+        tk.Button(fmt_row, text="Customize", bg=BG3, fg=FG,
                    font=FONT_SM, relief="flat", padx=8, pady=2,
                    cursor="hand2", command=self._open_builder).pack(side="left")
         self._update_fmt_preview()
 
-        # Options row
+        # Options
         opt = tk.Frame(self, bg=BG)
         opt.pack(fill="x", padx=20, pady=(0,4))
-        self.recursive_var  = tk.BooleanVar(value=self.cfg.get("recursive", True))
-        self.dryrun_var     = tk.BooleanVar(value=False)
-        self.dedup_var      = tk.BooleanVar(value=self.cfg.get("dedup", False))
-
-        for text, var in [("Scan subfolders recursively", self.recursive_var),
-                           ("Dry run  (preview only)", self.dryrun_var)]:
+        self.recursive_var = tk.BooleanVar(value=self.cfg.get("recursive", True))
+        self.dryrun_var    = tk.BooleanVar(value=False)
+        self.dedup_var     = tk.BooleanVar(value=self.cfg.get("dedup", False))
+        for text, var, color in [
+            ("Scan subfolders recursively", self.recursive_var, FG),
+            ("Dry run  (preview only)", self.dryrun_var, FG),
+            ("Find & move duplicates", self.dedup_var, PURPLE),
+        ]:
             tk.Checkbutton(opt, text=text, variable=var,
-                           bg=BG, fg=FG, selectcolor=BG3,
+                           bg=BG, fg=color, selectcolor=BG3,
                            activebackground=BG, activeforeground=GOLD,
                            font=FONT).pack(side="left", padx=(0,20))
-
-        # Duplicate checkbox — highlighted differently
-        dedup_chk = tk.Checkbutton(opt, text="Find & move duplicates",
-                                    variable=self.dedup_var,
-                                    bg=BG, fg=PURPLE, selectcolor=BG3,
-                                    activebackground=BG, activeforeground=PURPLE,
-                                    font=("Courier New",10,"bold"))
-        dedup_chk.pack(side="left", padx=(0,0))
 
         # Run / Cancel
         btn_row = tk.Frame(self, bg=BG)
         btn_row.pack(fill="x", padx=20, pady=(4,6))
-        self.run_btn = tk.Button(btn_row, text="▶  ORGANIZE & RENAME",
+        self.run_btn = tk.Button(btn_row, text="ORGANIZE & RENAME",
                                   bg=GOLD, fg="#111418", font=FONT_MED,
                                   relief="flat", padx=16, pady=7,
                                   cursor="hand2", command=self._run)
         self.run_btn.pack(side="left")
-        self.cancel_btn = tk.Button(btn_row, text="■  CANCEL",
+        self.cancel_btn = tk.Button(btn_row, text="CANCEL",
                                      bg=BG3, fg=RED, font=FONT_MED,
                                      relief="flat", padx=12, pady=7,
                                      cursor="hand2", command=self._cancel,
                                      state="disabled")
         self.cancel_btn.pack(side="left", padx=8)
 
-        # Progress bar
+        # Progress
         style = ttk.Style(self)
         style.theme_use("clam")
         style.configure("G.Horizontal.TProgressbar",
@@ -661,11 +737,14 @@ class OrganizerApp(tk.Tk):
         style.configure("P.Horizontal.TProgressbar",
                          background=PURPLE, troughcolor=BG3,
                          bordercolor=BG, lightcolor=PURPLE, darkcolor=PURPLE)
+        style.configure("S.Horizontal.TProgressbar",
+                         background=SNAP_YELLOW, troughcolor=BG3,
+                         bordercolor=BG, lightcolor=SNAP_YELLOW, darkcolor=SNAP_YELLOW)
         self.progress = ttk.Progressbar(self, style="G.Horizontal.TProgressbar",
                                          mode="determinate")
         self.progress.pack(fill="x", padx=20, pady=(0,4))
 
-        # Stat boxes — 7 boxes including duplicates
+        # Stat boxes
         sb_frame = tk.Frame(self, bg=BG)
         sb_frame.pack(fill="x", padx=20, pady=(0,4))
         self.sb_moved   = StatBox(sb_frame, "FILES MOVED",   color=GREEN)
@@ -679,7 +758,7 @@ class OrganizerApp(tk.Tk):
                   self.sb_rate,self.sb_elapsed,self.sb_remain):
             b.pack(side="left", fill="x", expand=True, padx=(0,2))
 
-        # Current file ticker
+        # Ticker
         tick = tk.Frame(self, bg=BG2, pady=5, padx=12)
         tick.pack(fill="x", padx=20, pady=(0,4))
         tk.Label(tick, text="NOW:", bg=BG2, fg=FG_DIM, font=FONT_SM).pack(side="left")
@@ -701,8 +780,22 @@ class OrganizerApp(tk.Tk):
         self.log.pack(fill="both", expand=True)
         for tag,fg_ in [("err",RED),("warn",ORANGE),("info",BLUE),("scan",FG_DIM),
                          ("done",GOLD),("file",GREEN),("divider","#2a2e36"),
-                         ("dupe",PURPLE)]:
+                         ("snap",SNAP_YELLOW)]:
             self.log.tag_config(tag, foreground=fg_)
+
+    # ── Snapchat toggle ───────────────────────────────────────────────────────
+    def _toggle_snap(self):
+        if self.snap_var.get():
+            self.snap_row.pack(fill="x", pady=(2,0))
+        else:
+            self.snap_row.pack_forget()
+
+    def _pick_snap(self):
+        f = filedialog.askopenfilename(
+            title="Select memories_history.json",
+            filetypes=[("JSON files","*.json"),("All files","*.*")]
+        )
+        if f: self.snap_json_var.set(os.path.normpath(f))
 
     # ── Folder rows ───────────────────────────────────────────────────────────
     def _folder_row(self, label, var_attr, recent_attr, cmd):
@@ -718,7 +811,7 @@ class OrganizerApp(tk.Tk):
         tk.Button(row, text="Browse", bg=BG3, fg=FG, font=FONT,
                    relief="flat", padx=10, cursor="hand2",
                    command=cmd).pack(side="left", padx=(4,0))
-        rb = tk.Menubutton(row, text="Recent ▾", bg=BG3, fg=FG_DIM,
+        rb = tk.Menubutton(row, text="Recent", bg=BG3, fg=FG_DIM,
                             font=FONT_SM, relief="flat", padx=6, cursor="hand2")
         rb.pack(side="left", padx=(2,0))
         menu = tk.Menu(rb, tearoff=0, bg=BG2, fg=FG,
@@ -763,12 +856,12 @@ class OrganizerApp(tk.Tk):
 
     def _update_fmt_preview(self):
         sample = render_filename(self.fmt_tokens, self.fmt_sep,
-                                  datetime(2022,9,15), 1, "ILCE-7RM5", "_DSC0052", ".arw")
-        self._fmt_preview_var.set(f"→  {sample}")
+                                  datetime(2022,9,15), 1, "ILCE-7RM5", "_DSC0052", "")
+        self._fmt_preview_var.set(f"->  {sample}")
 
     # ── Log & stats ───────────────────────────────────────────────────────────
     def _log(self, tag, msg):
-        if tag == "divider": msg = "─"*70
+        if tag == "divider": msg = "-"*70
         self.log.configure(state="normal")
         self.log.insert("end", msg+"\n", tag)
         self.log.see("end")
@@ -796,7 +889,7 @@ class OrganizerApp(tk.Tk):
         self.sb_remain.set(fmt_time(s['remaining']))
 
     def _on_progress(self, val, total, curr=""):
-        self.progress["maximum"] = max(total, 1)
+        self.progress["maximum"] = max(total,1)
         self.progress["value"]   = val
         if curr: self._curr_var.set(("..."+curr[-87:]) if len(curr)>90 else curr)
         self.update_idletasks()
@@ -805,29 +898,28 @@ class OrganizerApp(tk.Tk):
         self._curr_var.set(("..."+msg[-87:]) if len(msg)>90 else msg)
 
     def _on_phase(self, phase):
-        self._phase_var.set(f"● {phase}")
-        colors = {
-            "SCANNING":            FG_DIM,
-            "SCANNING DUPLICATES": PURPLE,
-            "ORGANIZING":          GOLD,
-        }
-        style_name = "P.Horizontal.TProgressbar" if "DUPLIC" in phase else "G.Horizontal.TProgressbar"
-        self.progress.configure(style=style_name)
+        self._phase_var.set(f"  {phase}")
+        if "DUPLIC" in phase:
+            self.progress.configure(style="P.Horizontal.TProgressbar")
+        elif "SNAP" in phase:
+            self.progress.configure(style="S.Horizontal.TProgressbar")
+        else:
+            self.progress.configure(style="G.Horizontal.TProgressbar")
 
     def _on_done(self, moved, xmps, dupes, errors, elapsed, status):
         self._running = False
-        self._phase_var.set("DONE" if status == "done" else status.upper())
+        self._phase_var.set("DONE" if status=="done" else status.upper())
         self.run_btn.configure(state="normal")
-        self.cancel_btn.configure(state="disabled", bg=BG3, text="■  CANCEL")
+        self.cancel_btn.configure(state="disabled", bg=BG3, text="CANCEL")
         dry = " (DRY RUN)" if self.dryrun_var.get() else ""
         if status == "cancelled":
-            self._log("warn", f"⚠  Cancelled{dry}  —  {moved:,} files kept  +  {xmps:,} XMPs  +  {dupes:,} dupes handled  in {fmt_time(elapsed)}")
+            self._log("warn", f"Cancelled{dry}  —  {moved:,} files kept  +  {xmps:,} XMPs  in {fmt_time(elapsed)}")
             self._curr_var.set("Cancelled — progress kept")
         elif status == "done":
-            dupe_note = f"  +  {dupes:,} dupes → _duplicates/" if dupes else ""
-            tag = "done" if errors == 0 else "err"
-            self._log(tag, f"✓ Complete{dry}  —  {moved:,} files  +  {xmps:,} XMPs{dupe_note}  ✗ {errors} errors  in {fmt_time(elapsed)}")
-            self._curr_var.set("Complete ✓")
+            dupe_note = f"  +  {dupes:,} dupes -> _duplicates/" if dupes else ""
+            tag = "done" if errors==0 else "err"
+            self._log(tag, f"Complete{dry}  —  {moved:,} files  +  {xmps:,} XMPs{dupe_note}  {errors} errors  in {fmt_time(elapsed)}")
+            self._curr_var.set("Complete")
         else:
             self._log("warn", f"Status: {status}")
 
@@ -835,7 +927,7 @@ class OrganizerApp(tk.Tk):
         if self._running:
             self._cancel_requested = True
             self.cancel_btn.configure(text="Cancelling...", state="disabled")
-            self._log("warn","⚠  Cancel requested — finishing current file...")
+            self._log("warn","Cancel requested — finishing current file...")
 
     # ── Run ───────────────────────────────────────────────────────────────────
     def _run(self):
@@ -847,10 +939,11 @@ class OrganizerApp(tk.Tk):
         if not src.is_dir():
             messagebox.showerror("Error",f"Source folder not found:\n{src}"); return
 
-        dst = Path(os.path.normpath(dst_str)) if dst_str else src
+        dst       = Path(os.path.normpath(dst_str)) if dst_str else src
         dry       = self.dryrun_var.get()
         recursive = self.recursive_var.get()
         dedup     = self.dedup_var.get()
+        snap_json = self.snap_json_var.get().strip() if self.snap_var.get() else None
 
         if not dry and not dst.exists():
             dst.mkdir(parents=True, exist_ok=True)
@@ -865,14 +958,14 @@ class OrganizerApp(tk.Tk):
         self.cancel_btn.configure(state="normal", bg="#2a1818")
 
         if not PILLOW_AVAILABLE:
-            self._log("warn","⚠  Pillow not installed — EXIF unavailable.")
+            self._log("warn","Pillow not installed — EXIF unavailable.")
 
         sample  = render_filename(self.fmt_tokens, self.fmt_sep,
-                                   datetime(2022,9,15),1,"CAM","ORIG",".arw")
+                                   datetime(2022,9,15),1,"CAM","ORIG","")
         dry_lbl = "  [DRY RUN]" if dry else ""
-        self._log("info", f"Source     : {src}{dry_lbl}")
-        self._log("info", f"Dest       : {dst}")
-        self._log("info", f"Recursive  : {recursive}  |  Format: {sample}  |  Dedup: {dedup}")
+        self._log("info", f"Source    : {src}{dry_lbl}")
+        self._log("info", f"Dest      : {dst}")
+        self._log("info", f"Recursive : {recursive}  |  Format: {sample}  |  Dedup: {dedup}  |  Snapchat: {bool(snap_json)}")
         self._log("divider","")
 
         callbacks = {
@@ -887,7 +980,7 @@ class OrganizerApp(tk.Tk):
         threading.Thread(
             target=run_job,
             args=(src, dst, recursive, dry, list(self.fmt_tokens), self.fmt_sep,
-                  dedup, lambda: self._cancel_requested, callbacks),
+                  dedup, snap_json, lambda: self._cancel_requested, callbacks),
             daemon=True
         ).start()
 
